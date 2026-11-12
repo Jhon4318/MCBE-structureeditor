@@ -1,0 +1,89 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64 executable
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Verify Python and Tkinter
+        shell: pwsh
+        run: |
+          python --version
+          python -c "import tkinter; print('Tkinter:', tkinter.TkVersion)"
+          python -m py_compile mcstructure_merger_v2_features_bundle.py
+
+      - name: Run NBT smoke tests
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -v
+
+      - name: Install build dependency
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Build standalone GUI executable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name MCBE-StructureEditor --distpath dist --workpath build/pyinstaller mcstructure_merger_v2_features_bundle.py
+          if (!(Test-Path "dist/MCBE-StructureEditor.exe")) {
+            throw "PyInstaller did not create dist/MCBE-StructureEditor.exe"
+          }
+          $exe = Get-Item "dist/MCBE-StructureEditor.exe"
+          if ($exe.Length -lt 1000000) {
+            throw "The generated EXE is unexpectedly small ($($exe.Length) bytes)"
+          }
+          Write-Host "Built EXE: $($exe.Length) bytes"
+
+      - name: Package Windows distribution
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item "dist/MCBE-StructureEditor.exe" "package/MCBE-StructureEditor.exe"
+          Copy-Item "README-Windows.txt" "package/README.txt"
+          Compress-Archive -Path "package/*" -DestinationPath "MCBE-StructureEditor-windows-x64.zip" -Force
+          $zip = Get-Item "MCBE-StructureEditor-windows-x64.zip"
+          "### Windows build" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "- Executable: `$($exe.Name)`" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "- ZIP size: $($zip.Length) bytes" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload Windows build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MCBE-StructureEditor-windows-x64
+          path: MCBE-StructureEditor-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach ZIP to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MCBE-StructureEditor-windows-x64.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
