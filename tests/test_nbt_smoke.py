@@ -44,7 +44,7 @@ class NbtSmokeTests(unittest.TestCase):
         data = (
             b"\x0a\x00\x00"       # root type + empty root name
             + b"\x09"             # ListTag
-            + b"\x07\x00bad"     # name "bad"
+            + b"\x03\x00bad"     # name "bad"
             + b"\x0d"             # invalid element type 13
             + b"\x00\x00\x00\x00"  # list length 0
             + b"\x00"             # end compound
