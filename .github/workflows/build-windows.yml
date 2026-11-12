@@ -68,7 +68,7 @@ jobs:
           Compress-Archive -Path "package/*" -DestinationPath "MCBE-StructureEditor-windows-x64.zip" -Force
           $zip = Get-Item "MCBE-StructureEditor-windows-x64.zip"
           "### Windows build" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          "- Executable: `$($exe.Name)`" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "- Executable: `MCBE-StructureEditor.exe`" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           "- ZIP size: $($zip.Length) bytes" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: Upload Windows build artifact
