@@ -55,3 +55,8 @@ Windows EXEのビルドは GitHub Actions が Windows runner 上で PyInstaller 
 ## License
 
 ライセンスはリポジトリで別途指定されるまで、権利者の許諾なく再配布・改変できるものとして扱わないでください。
+
+
+## Build status
+
+Windows x64 binaries are built automatically by GitHub Actions on pushes to `main`. Open the Actions tab and download the `MCBE-StructureEditor-windows-x64` artifact from a successful run.
