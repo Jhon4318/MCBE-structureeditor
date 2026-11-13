@@ -613,7 +613,9 @@ class MainWindow(QMainWindow):
             if loaded is None:loaded=core.load_structure(path); cache[path]=loaded
             self.rows.append({"id":item["id"],"path":path,"display_path":item.get("display_path",path),"loaded":loaded,"x":item["x"],"y":item["y"],"z":item["z"],"rotation":item["rotation"],"mirror_x":item["mirror_x"],"mirror_z":item["mirror_z"]})
         self.selected_id=self.rows[0]["id"] if self.rows else None
+        self.overlap.blockSignals(True)
         self.overlap.setCurrentIndex(max(0,self.overlap.findData(overlap)))
+        self.overlap.blockSignals(False)
         self.refresh_list(); self.save_timer.start()
 
     def undo(self):
@@ -657,6 +659,9 @@ class MainWindow(QMainWindow):
                 self.rows.append({"id":int(item.get("instance_id",self._next_id)),"path":path,"display_path":item.get("display_path",path),"loaded":loaded,"x":int(item["x"]),"y":int(item["y"]),"z":int(item["z"]),"rotation":int(item.get("rotation",0)),"mirror_x":bool(item.get("mirror_x",False)),"mirror_z":bool(item.get("mirror_z",False))})
                 self._next_id=max(self._next_id,self.rows[-1]["id"]+1)
             self.overlap_mode=payload.get("overlap_mode","last_defined")
+            self.overlap.blockSignals(True)
+            self.overlap.setCurrentIndex(max(0,self.overlap.findData(self.overlap_mode)))
+            self.overlap.blockSignals(False)
             self.selected_id=self.rows[0]["id"] if self.rows else None
             self.refresh_list()
             if self.rows:self.statusBar().showMessage(f"前回の作業を{len(self.rows)}件復元しました",6000)
@@ -668,6 +673,9 @@ class MainWindow(QMainWindow):
         path,_=QFileDialog.getSaveFileName(self,"結合後の.mcstructureを保存","merged_v2.mcstructure","Minecraft structure (*.mcstructure)")
         if not path:return
         if not path.lower().endswith(".mcstructure"):path+=".mcstructure"
+        if any(os.path.abspath(path) == os.path.abspath(r["path"]) for r in self.rows):
+            QMessageBox.critical(self,"保存先エラー","入力元の.mcstructureと同じファイルには保存できません。別名を指定してください。")
+            return
         try:
             inputs=[(r["path"],(r["x"],r["y"],r["z"]),r["rotation"],r["mirror_x"],r["mirror_z"]) for r in self.rows]
             result=core.merge_structures(inputs,path,self.overlap_mode)
