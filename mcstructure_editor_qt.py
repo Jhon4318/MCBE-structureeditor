@@ -125,10 +125,10 @@ class PreviewWidget(QOpenGLWidget):
         primary = np.frombuffer(src.layers[0], dtype=np.int32)
         secondary = np.frombuffer(src.layers[1], dtype=np.int32) if len(src.layers) > 1 else None
         pvalid = (primary >= 0) & (primary < len(names))
-        solid_mask = pvalid & palette_solid[np.maximum(primary, 0)]
+        solid_mask = pvalid & palette_solid[np.clip(primary, 0, len(names)-1)]
         if secondary is not None:
             svalid = (secondary >= 0) & (secondary < len(names))
-            solid_mask |= svalid & palette_solid[np.maximum(secondary, 0)]
+            solid_mask |= svalid & palette_solid[np.clip(secondary, 0, len(names)-1)]
         solid_count = int(np.count_nonzero(solid_mask))
         stride = max(1, int(math.ceil(solid_count / 140000)))
         candidates = np.flatnonzero(solid_mask[::stride]).astype(np.int64) * stride
