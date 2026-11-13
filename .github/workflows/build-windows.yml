@@ -45,6 +45,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-build.txt
           python -c "import PySide6, numpy; print('PySide6:', PySide6.__version__, 'NumPy:', numpy.__version__)"
+          python -c "import mcstructure_editor_qt; print('Qt editor import: OK')"
 
       - name: Build standalone GUI executable
         shell: pwsh
