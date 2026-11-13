@@ -134,7 +134,7 @@ class PreviewWidget(QOpenGLWidget):
             svalid = (secondary >= 0) & (secondary < len(names))
             solid_mask |= svalid & palette_solid[np.clip(secondary, 0, len(names)-1)]
         solid_count = int(np.count_nonzero(solid_mask))
-        stride = max(1, int(math.ceil(solid_count / 140000)))
+        stride = max(1, int(math.ceil(solid_count / 60000)))
         candidates = np.flatnonzero(solid_mask[::stride]).astype(np.int64) * stride
         def block_at(index):
             if index < 0 or index >= len(primary):
