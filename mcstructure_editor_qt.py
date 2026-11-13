@@ -14,13 +14,15 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 import mcstructure_merger_v2_features_bundle as core
-from PySide6.QtCore import Qt, QTimer, QSize
+import numpy as np
+from PySide6.QtCore import Qt, QTimer, QSize, QRectF
 from PySide6.QtGui import QAction, QColor, QFont, QImage, QPainter, QPainterPath, QPen, QBrush
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QToolBar,
     QDockWidget, QFormLayout, QSpinBox, QComboBox, QPushButton, QLabel,
-    QFileDialog, QMessageBox, QStatusBar, QStackedWidget, QOpenGLWidget,
+    QFileDialog, QMessageBox, QStatusBar, QStackedWidget,
     QFrame, QLineEdit, QInputDialog, QMenu, QCheckBox, QAbstractItemView
 )
 
@@ -117,27 +119,42 @@ class PreviewWidget(QOpenGLWidget):
         sx, sy, sz = src.size
         names = palette_names(src)
         air = {i for i, n in enumerate(names) if n == "minecraft:air" or n.endswith(":air")}
-        solid = {}
-        for li, layer in enumerate(src.layers):
-            for idx, pidx in enumerate(layer):
-                if pidx >= 0 and pidx < len(names) and pidx not in air:
-                    solid.setdefault(idx, pidx)
-        # Secondary layer takes precedence only where it contains a real block.
-        cells = set(solid)
+        palette_solid = np.ones(len(names), dtype=np.bool_)
+        if air:
+            palette_solid[list(air)] = False
+        primary = np.frombuffer(src.layers[0], dtype=np.int32)
+        secondary = np.frombuffer(src.layers[1], dtype=np.int32) if len(src.layers) > 1 else None
+        pvalid = (primary >= 0) & (primary < len(names))
+        solid_mask = pvalid & palette_solid[np.maximum(primary, 0)]
+        if secondary is not None:
+            svalid = (secondary >= 0) & (secondary < len(names))
+            solid_mask |= svalid & palette_solid[np.maximum(secondary, 0)]
+        solid_count = int(np.count_nonzero(solid_mask))
+        stride = max(1, int(math.ceil(solid_count / 140000)))
+        candidates = np.flatnonzero(solid_mask[::stride]).astype(np.int64) * stride
+        def block_at(index):
+            if index < 0 or index >= len(primary):
+                return -1
+            if secondary is not None:
+                value = int(secondary[index])
+                if 0 <= value < len(names) and palette_solid[value]:
+                    return value
+            value = int(primary[index])
+            return value if 0 <= value < len(names) and palette_solid[value] else -1
         mesh = []
-        if len(cells) > 140000:
-            stride = max(1, int(math.ceil(len(cells) / 140000)))
-            cells = set(sorted(cells)[::stride])
-        for idx in cells:
+        for raw_idx in candidates:
+            idx = int(raw_idx)
+            pidx = block_at(idx)
+            if pidx < 0:
+                continue
             x = idx // (sy * sz); y = (idx // sz) % sy; z = idx % sz
-            pidx = solid[idx]
             c = block_color(names[pidx])
-            # Faces are emitted only when the adjacent cell is empty.
-            if y + 1 >= sy or (idx + sz not in solid):
+            # Faces are emitted only when the adjacent voxel is empty.
+            if y + 1 >= sy or block_at(idx + sz) < 0:
                 mesh.append((x, y, z, c, "top"))
-            if x + 1 >= sx or ((x + 1) * sy + y) * sz + z not in solid:
+            if x + 1 >= sx or block_at(idx + sy * sz) < 0:
                 mesh.append((x, y, z, c, "right"))
-            if z + 1 >= sz or (x * sy + y) * sz + z + 1 not in solid:
+            if z + 1 >= sz or block_at(idx + 1) < 0:
                 mesh.append((x, y, z, c, "left"))
         self._mesh_cache[key] = (src.size, mesh)
         return src.size, mesh
@@ -184,9 +201,9 @@ class PreviewWidget(QOpenGLWidget):
         for x,z,sx,sz,r in bounds:
             rect = (ox+x*scale, oy+z*scale, sx*scale, sz*scale)
             color = QColor("#dc5555") if self.window.overlaps(r) else QColor("#4f8edb")
-            p.fillRect(*rect, QColor(color.red(),color.green(),color.blue(),55))
+            p.fillRect(QRectF(*rect), QColor(color.red(),color.green(),color.blue(),55))
             p.setPen(QPen(color, 3 if r["id"] == self.window.selected_id else 2))
-            p.drawRect(*rect)
+            p.drawRect(QRectF(*rect))
             if rect[2] > 70 and rect[3] > 30:
                 p.setPen(QColor("#f2f4f7") if self.window.theme=="dark" else QColor("#344054"))
                 p.drawText(int(rect[0]+5),int(rect[1]+19),Path(r["display_path"]).name)
