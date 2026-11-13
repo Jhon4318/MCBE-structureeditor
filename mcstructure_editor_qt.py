@@ -105,10 +105,12 @@ class PreviewWidget(QOpenGLWidget):
         self.pan_x = 0.0
         self.pan_y = 0.0
         self._mesh_cache = {}
+        self._top_cache = {}
         self.setUpdateBehavior(QOpenGLWidget.UpdateBehavior.PartialUpdate)
 
     def invalidate(self):
         self._mesh_cache.clear()
+        self._top_cache.clear()
         self.update()
 
     def _structure_mesh(self, row):
@@ -175,6 +177,49 @@ class PreviewWidget(QOpenGLWidget):
             self._paint_iso(p)
         p.end()
 
+    def _top_image(self, row):
+        key = (row["id"], row["rotation"], row["mirror_x"], row["mirror_z"])
+        cached = self._top_cache.get(key)
+        if cached is not None:
+            return cached
+        src = core.transform_loaded_structure(row["loaded"], row["rotation"], row["mirror_x"], row["mirror_z"])
+        sx, sy, sz = src.size
+        # Bound the raster to ~1.5M samples so very wide structures cannot
+        # allocate a viewport-sized array or stall the UI.
+        step = max(1, int(math.ceil(math.sqrt((sx * sz) / 1500000))))
+        names = palette_names(src)
+        palette_solid = np.ones(len(names), dtype=np.bool_)
+        for i, name in enumerate(names):
+            if name == "minecraft:air" or name.endswith(":air"):
+                palette_solid[i] = False
+        palette_rgb = np.asarray([[block_color(n).red(), block_color(n).green(), block_color(n).blue()] for n in names], dtype=np.uint8)
+        primary = np.frombuffer(src.layers[0], dtype=np.int32).reshape((sx, sy, sz))[::step, :, ::step]
+        pvalid = (primary >= 0) & (primary < len(names))
+        solid0 = pvalid & palette_solid[np.clip(primary, 0, len(names)-1)]
+        secondary = None
+        solid1 = None
+        if len(src.layers) > 1:
+            secondary = np.frombuffer(src.layers[1], dtype=np.int32).reshape((sx, sy, sz))[::step, :, ::step]
+            svalid = (secondary >= 0) & (secondary < len(names))
+            solid1 = svalid & palette_solid[np.clip(secondary, 0, len(names)-1)]
+            solid = solid0 | solid1
+        else:
+            solid = solid0
+        has_block = solid.any(axis=1)
+        top_y = sy - 1 - solid[:, ::-1, :].argmax(axis=1)
+        pidx = np.take_along_axis(primary, top_y[:, None, :], axis=1)[:, 0, :]
+        if secondary is not None:
+            sidx = np.take_along_axis(secondary, top_y[:, None, :], axis=1)[:, 0, :]
+            use_secondary = np.take_along_axis(solid1, top_y[:, None, :], axis=1)[:, 0, :]
+            pidx = np.where(use_secondary, sidx, pidx)
+        rgba = np.zeros((primary.shape[0], primary.shape[2], 4), dtype=np.uint8)
+        rgba[has_block, :3] = palette_rgb[pidx[has_block]]
+        rgba[has_block, 3] = 255
+        raster = np.transpose(rgba, (1, 0, 2)).copy()
+        image = QImage(raster.data, raster.shape[1], raster.shape[0], raster.shape[1] * 4, QImage.Format.Format_RGBA8888).copy()
+        self._top_cache[key] = image
+        return image
+
     def _paint_top(self, p):
         rows = self.window.rows
         bounds = []
@@ -200,8 +245,10 @@ class PreviewWidget(QOpenGLWidget):
                 py=oy+z*scale; p.drawLine(0,int(py),self.width(),int(py))
         for x,z,sx,sz,r in bounds:
             rect = (ox+x*scale, oy+z*scale, sx*scale, sz*scale)
+            image = self._top_image(r)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            p.drawImage(QRectF(*rect), image)
             color = QColor("#dc5555") if self.window.overlaps(r) else QColor("#4f8edb")
-            p.fillRect(QRectF(*rect), QColor(color.red(),color.green(),color.blue(),55))
             p.setPen(QPen(color, 3 if r["id"] == self.window.selected_id else 2))
             p.drawRect(QRectF(*rect))
             if rect[2] > 70 and rect[3] > 30:
