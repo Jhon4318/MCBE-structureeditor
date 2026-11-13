@@ -106,11 +106,13 @@ class PreviewWidget(QOpenGLWidget):
         self.pan_y = 0.0
         self._mesh_cache = {}
         self._top_cache = {}
+        self._path_cache = {}
         self.setUpdateBehavior(QOpenGLWidget.UpdateBehavior.PartialUpdate)
 
     def invalidate(self):
         self._mesh_cache.clear()
         self._top_cache.clear()
+        self._path_cache.clear()
         self.update()
 
     def _structure_mesh(self, row):
@@ -160,6 +162,43 @@ class PreviewWidget(QOpenGLWidget):
                 mesh.append((x, y, z, c, "left"))
         self._mesh_cache[key] = (src.size, mesh)
         return src.size, mesh
+
+    def _projected_paths(self, row):
+        key = (row["id"], row["rotation"], row["mirror_x"], row["mirror_z"])
+        cached = self._path_cache.get(key)
+        if cached is not None:
+            return cached
+        _size, mesh = self._structure_mesh(row)
+        buckets = {}
+        from PySide6.QtCore import QPointF
+        for x, y, z, base, face in mesh:
+            if face == "top":
+                points = [((x-z)*6.5, (x+z)*3.5-(y+1)*13),
+                          ((x+1-z)*6.5, (x+1+z)*3.5-(y+1)*13),
+                          ((x+1-z-1)*6.5, (x+1+z+1)*3.5-(y+1)*13),
+                          ((x-z-1)*6.5, (x+z+1)*3.5-(y+1)*13)]
+                shade = 1.12
+            elif face == "right":
+                points = [((x+1-z)*6.5, (x+1+z)*3.5-y*13),
+                          ((x+1-z)*6.5, (x+1+z)*3.5-(y+1)*13),
+                          ((x-z-1)*6.5, (x+z+2)*3.5-(y+1)*13),
+                          ((x-z-1)*6.5, (x+z+2)*3.5-y*13)]
+                shade = .72
+            else:
+                points = [((x-z-1)*6.5, (x+z+1)*3.5-y*13),
+                          ((x-z-1)*6.5, (x+z+1)*3.5-(y+1)*13),
+                          ((x+1-z-1)*6.5, (x+1+z+1)*3.5-(y+1)*13),
+                          ((x+1-z-1)*6.5, (x+1+z+1)*3.5-y*13)]
+                shade = .88
+            color = QColor(min(255,int(base.red()*shade)),min(255,int(base.green()*shade)),min(255,int(base.blue()*shade))).name()
+            depth = x + z + y
+            path = buckets.setdefault(depth, {}).setdefault(color, QPainterPath())
+            path.moveTo(QPointF(*points[0]))
+            for point in points[1:]:
+                path.lineTo(QPointF(*point))
+            path.closeSubpath()
+        self._path_cache[key] = buckets
+        return buckets
 
     def paintGL(self):
         p = QPainter(self)
@@ -258,47 +297,31 @@ class PreviewWidget(QOpenGLWidget):
         p.drawText(12,self.height()-12,f"上面図  |  範囲 {spanx} × {spanz} blocks  |  64ブロックグリッド")
 
     def _paint_iso(self, p):
-        all_mesh = []
-        world_min = [10**9,10**9,10**9]; world_max=[-10**9,-10**9,-10**9]
+        if not self.window.rows:
+            return
+        bounds = []
         for row in self.window.rows:
-            size, mesh = self._structure_mesh(row)
-            sx,sy,sz=size
-            world_min=[min(world_min[0],row["x"]),min(world_min[1],row["y"]),min(world_min[2],row["z"])]
-            world_max=[max(world_max[0],row["x"]+sx),max(world_max[1],row["y"]+sy),max(world_max[2],row["z"]+sz)]
-            all_mesh.append((row,mesh))
-        spanx=max(1,world_max[0]-world_min[0]); spany=max(1,world_max[1]-world_min[1]); spanz=max(1,world_max[2]-world_min[2])
-        tw=13.0*self.zoom; th=7.0*self.zoom; vh=13.0*self.zoom
-        cx=(world_min[0]+world_max[0])/2; cz=(world_min[2]+world_max[2])/2
-        center_x=self.width()/2+self.pan_x
-        center_y=self.height()/2+self.pan_y + spany*vh*0.25
-        def pt(x,y,z):
-            return (center_x+(x-z-cx+cz)*tw/2, center_y+(x+z-cx-cz)*th/2-(y-world_min[1])*vh)
-        paths={}
-        face_order={"left":0,"right":1,"top":2}
-        for row,mesh in all_mesh:
-            for x,y,z,c,face in mesh:
-                wx=x+row["x"]; wy=y+row["y"]; wz=z+row["z"]
-                if face=="top":
-                    pts=[pt(wx,wy+1,wz),pt(wx+1,wy+1,wz),pt(wx+1,wy+1,wz+1),pt(wx,wy+1,wz+1)]
-                    shade=1.12
-                elif face=="right":
-                    pts=[pt(wx+1,wy,wz),pt(wx+1,wy+1,wz),pt(wx+1,wy+1,wz+1),pt(wx+1,wy,wz+1)]
-                    shade=.72
-                else:
-                    pts=[pt(wx,wy,wz+1),pt(wx,wy+1,wz+1),pt(wx+1,wy+1,wz+1),pt(wx+1,wy,wz+1)]
-                    shade=.88
-                cc=QColor(min(255,int(c.red()*shade)),min(255,int(c.green()*shade)),min(255,int(c.blue()*shade)))
-                path=paths.setdefault(cc.name(),QPainterPath())
-                from PySide6.QtCore import QPointF
-                path.moveTo(QPointF(*pts[0]))
-                for q in pts[1:]: path.lineTo(QPointF(*q))
-                path.closeSubpath()
-        for color,path in paths.items():
-            p.setPen(QPen(QColor("#151a22") if self.window.theme=="dark" else QColor("#64748b"),0.35))
-            p.setBrush(QBrush(QColor(color)))
-            p.drawPath(path)
+            sx, sy, sz = self.window.dimensions(row)
+            bounds.append((row, sx, sy, sz))
+        minx = min(r["x"] for r, *_ in bounds); miny = min(r["y"] for r, *_ in bounds); minz = min(r["z"] for r, *_ in bounds)
+        maxx = max(r["x"]+sx for r,sx,sy,sz in bounds); maxy = max(r["y"]+sy for r,sx,sy,sz in bounds); maxz = max(r["z"]+sz for r,sx,sy,sz in bounds)
+        cx=(minx+maxx)/2; cy=(miny+maxy)/2; cz=(minz+maxz)/2
+        base_x=(cx-cz)*6.5
+        base_y=(cx+cz)*3.5-cy*13
+        for row, _sx, _sy, _sz in bounds:
+            buckets = self._projected_paths(row)
+            p.save()
+            p.translate(self.width()/2+self.pan_x-base_x, self.height()/2+self.pan_y-base_y)
+            p.scale(self.zoom,self.zoom)
+            p.translate((row["x"]-row["z"])*6.5, (row["x"]+row["z"])*3.5-row["y"]*13)
+            for depth in sorted(buckets):
+                for color,path in buckets[depth].items():
+                    p.setPen(QPen(QColor("#151a22") if self.window.theme=="dark" else QColor("#64748b"),0.35))
+                    p.setBrush(QBrush(QColor(color)))
+                    p.drawPath(path)
+            p.restore()
         p.setPen(QColor("#aab5c5"))
-        p.drawText(12,self.height()-12,f"簡易3D  |  表示面を省略して描画  |  近似マテリアル")
+        p.drawText(12,self.height()-12,"簡易3D  |  露出面のみ描画・形状キャッシュ  |  近似マテリアル")
 
     def mousePressEvent(self,e):
         if e.button()==Qt.MouseButton.RightButton:
