@@ -7,7 +7,8 @@ Minecraft Bedrock Edition の `.mcstructure` v2 専用・配置結合ツール�
 - 複数の `.mcstructure` / ZIP の読み込み
 - X/Y/Z 座標指定、90度回転、X/Zミラー
 - X方向・Z方向・グリッドで最大100個の連続配置
-- 配置プレビュー、上面プレビュー、簡易3Dボクセルプレビュー
+- Qt6ベースの高DPI対応UI（ダーク／ライト切り替え）
+- 3D／上面図切り替えプレビュー。表示面の省略・NumPyによる高速なボクセル抽出・メッシュキャッシュを使用
 - 複数選択、グループ移動・回転・整列
 - Undo / Redo
 - 重なり部分の結合ルール選択
@@ -37,10 +38,11 @@ Pythonのインストールは不要です。
 ## 開発・ローカル実行
 
 - Python 3.10 以降
-- Windowsでは Tkinter を含むPython
+- PySide6、NumPy（`requirements-build.txt` に記載）
 
 ```powershell
-python mcstructure_merger_v2_features_bundle.py
+python -m pip install -r requirements-build.txt
+python mcstructure_editor_qt.py
 ```
 
 Windows EXEのビルドは GitHub Actions が Windows runner 上で PyInstaller を実行します。
@@ -48,7 +50,7 @@ Windows EXEのビルドは GitHub Actions が Windows runner 上で PyInstaller 
 ## 対象外・注意事項
 
 - `.mcstructure` format_version 1 は未対応です。
-- 3Dプレビューはブロック形状・色・陰影による簡易表示で、公式リソースパックの全テクスチャを再現するものではありません。
+- 3Dプレビューは近似色による簡易表示です。公式リソースパックの全テクスチャは再現しません。大規模構造物では描画負荷を抑えるため、3Dプレビューの表示ブロック数を制限します。
 - NBT検証の成功は、すべてのアドオン・カスタムブロック・Minecraftバージョンとの完全互換性を保証するものではありません。
 - 大きな構造物の処理には十分なメモリが必要です。
 
