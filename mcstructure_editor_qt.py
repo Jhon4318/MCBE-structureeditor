@@ -181,8 +181,8 @@ class PreviewWidget(QOpenGLWidget):
             elif face == "right":
                 points = [((x+1-z)*6.5, (x+1+z)*3.5-y*13),
                           ((x+1-z)*6.5, (x+1+z)*3.5-(y+1)*13),
-                          ((x-z-1)*6.5, (x+z+2)*3.5-(y+1)*13),
-                          ((x-z-1)*6.5, (x+z+2)*3.5-y*13)]
+                          ((x-z)*6.5, (x+z+2)*3.5-(y+1)*13),
+                          ((x-z)*6.5, (x+z+2)*3.5-y*13)]
                 shade = .72
             else:
                 points = [((x-z-1)*6.5, (x+z+1)*3.5-y*13),
