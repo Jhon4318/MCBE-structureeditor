@@ -28,12 +28,12 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-build.txt
 
-      - name: Verify Python and Tkinter
+      - name: Verify Python, Qt6 and source
         shell: pwsh
         run: |
           python --version
-          python -c "import tkinter; print('Tkinter:', tkinter.TkVersion)"
-          python -m py_compile mcstructure_merger_v2_features_bundle.py
+          python -c "import PySide6, numpy; print('PySide6:', PySide6.__version__, 'NumPy:', numpy.__version__)"
+          python -m py_compile mcstructure_merger_v2_features_bundle.py mcstructure_editor_qt.py
 
       - name: Run NBT smoke tests
         shell: pwsh
@@ -49,7 +49,7 @@ jobs:
       - name: Build standalone GUI executable
         shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name MCBE-StructureEditor --distpath dist --workpath build/pyinstaller mcstructure_merger_v2_features_bundle.py
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name MCBE-StructureEditor --distpath dist --workpath build/pyinstaller --collect-all PySide6 --collect-all shiboken6 --collect-all numpy --hidden-import=PySide6.QtOpenGLWidgets mcstructure_editor_qt.py
           if (!(Test-Path "dist/MCBE-StructureEditor.exe")) {
             throw "PyInstaller did not create dist/MCBE-StructureEditor.exe"
           }
