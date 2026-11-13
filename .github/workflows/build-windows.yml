@@ -32,7 +32,6 @@ jobs:
         shell: pwsh
         run: |
           python --version
-          python -c "import PySide6, numpy; print('PySide6:', PySide6.__version__, 'NumPy:', numpy.__version__)"
           python -m py_compile mcstructure_merger_v2_features_bundle.py mcstructure_editor_qt.py
 
       - name: Run NBT smoke tests
@@ -45,6 +44,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-build.txt
+          python -c "import PySide6, numpy; print('PySide6:', PySide6.__version__, 'NumPy:', numpy.__version__)"
 
       - name: Build standalone GUI executable
         shell: pwsh
