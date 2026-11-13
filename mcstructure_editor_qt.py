@@ -92,21 +92,25 @@ def palette_names(src):
     return result
 
 class PreviewWidget(QOpenGLWidget):
-    """Qt OpenGL-backed viewport; QPainter batches exposed voxel faces into paths."""
+    """Interactive, cached viewport for top-down placement and 3D orbit navigation."""
     def __init__(self, window):
         super().__init__(window)
         self.window = window
         self.setMinimumSize(420, 360)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
         self.mode = "3d"
-        self._drag = None
-        self._pan = None
         self.zoom = 1.0
         self.pan_x = 0.0
         self.pan_y = 0.0
+        self.yaw = math.radians(45.0)
+        self.pitch = math.radians(32.0)
+        self._gesture = None
         self._mesh_cache = {}
         self._top_cache = {}
         self._path_cache = {}
+        self._active_top_transform = None
+        self._active_iso_transform = None
         self.setUpdateBehavior(QOpenGLWidget.UpdateBehavior.PartialUpdate)
 
     def invalidate(self):
@@ -115,6 +119,66 @@ class PreviewWidget(QOpenGLWidget):
         self._path_cache.clear()
         self.update()
 
+    @staticmethod
+    def _snap64(value):
+        return int(math.floor((float(value) / 64.0) + 0.5) * 64)
+
+    def _top_transform(self):
+        if self._active_top_transform is not None:
+            return self._active_top_transform
+        minx, minz, spanx, spanz = self.window.bounds()
+        scale = min((self.width() - 80) / max(1, spanx),
+                    (self.height() - 80) / max(1, spanz)) * self.zoom
+        scale = max(0.015, min(scale, 24.0))
+        ox = (self.width() - spanx * scale) / 2 - minx * scale + self.pan_x
+        oy = (self.height() - spanz * scale) / 2 - minz * scale + self.pan_y
+        return {"scale": scale, "ox": ox, "oy": oy}
+
+    def _project_raw(self, x, y, z, yaw=None, pitch=None):
+        yaw = self.yaw if yaw is None else yaw
+        pitch = self.pitch if pitch is None else pitch
+        root2 = math.sqrt(2.0)
+        yaw_c, yaw_s = math.cos(yaw), math.sin(yaw)
+        pitch_factor = math.sin(pitch) / math.sin(math.radians(32.0))
+        vertical_factor = math.cos(pitch) / math.cos(math.radians(32.0))
+        px = 6.5 * root2 * (x * yaw_c - z * yaw_s)
+        py = 3.5 * root2 * (x * yaw_s + z * yaw_c) * pitch_factor - 13.0 * y * vertical_factor
+        return px, py
+
+    def _iso_transform(self):
+        if self._active_iso_transform is not None:
+            return self._active_iso_transform
+        if not self.window.rows:
+            return {"scale": 1.0, "ox": self.width()/2, "oy": self.height()/2}
+        entries = []
+        for row in self.window.rows:
+            sx, sy, sz = self.window.dimensions(row)
+            entries.append((row, sx, sy, sz))
+        minx = min(row["x"] for row, *_ in entries)
+        miny = min(row["y"] for row, *_ in entries)
+        minz = min(row["z"] for row, *_ in entries)
+        maxx = max(row["x"] + sx for row, sx, _, _ in entries)
+        maxy = max(row["y"] + sy for row, _, sy, _ in entries)
+        maxz = max(row["z"] + sz for row, _, _, sz in entries)
+        corners = [(x, y, z)
+                   for x in (minx, maxx)
+                   for y in (miny, maxy)
+                   for z in (minz, maxz)]
+        projected = [self._project_raw(*point) for point in corners]
+        minpx = min(point[0] for point in projected)
+        maxpx = max(point[0] for point in projected)
+        minpy = min(point[1] for point in projected)
+        maxpy = max(point[1] for point in projected)
+        spanpx = max(1.0, maxpx - minpx)
+        spanpy = max(1.0, maxpy - minpy)
+        fit = min((self.width() - 100) / spanpx, (self.height() - 100) / spanpy)
+        scale = max(0.015, min(6.0, fit * self.zoom))
+        return {
+            "scale": scale,
+            "ox": self.width()/2 + self.pan_x - ((minpx + maxpx)/2) * scale,
+            "oy": self.height()/2 + self.pan_y - ((minpy + maxpy)/2) * scale,
+        }
+
     def _structure_mesh(self, row):
         key = (row["id"], row["rotation"], row["mirror_x"], row["mirror_z"])
         if key in self._mesh_cache:
@@ -122,10 +186,10 @@ class PreviewWidget(QOpenGLWidget):
         src = core.transform_loaded_structure(row["loaded"], row["rotation"], row["mirror_x"], row["mirror_z"])
         sx, sy, sz = src.size
         names = palette_names(src)
-        air = {i for i, n in enumerate(names) if n == "minecraft:air" or n.endswith(":air")}
         palette_solid = np.ones(len(names), dtype=np.bool_)
-        if air:
-            palette_solid[list(air)] = False
+        for i, name in enumerate(names):
+            if name == "minecraft:air" or name.endswith(":air"):
+                palette_solid[i] = False
         primary = np.frombuffer(src.layers[0], dtype=np.int32)
         secondary = np.frombuffer(src.layers[1], dtype=np.int32) if len(src.layers) > 1 else None
         pvalid = (primary >= 0) & (primary < len(names))
@@ -136,6 +200,7 @@ class PreviewWidget(QOpenGLWidget):
         solid_count = int(np.count_nonzero(solid_mask))
         stride = max(1, int(math.ceil(solid_count / 60000)))
         candidates = np.flatnonzero(solid_mask[::stride]).astype(np.int64) * stride
+
         def block_at(index):
             if index < 0 or index >= len(primary):
                 return -1
@@ -145,76 +210,116 @@ class PreviewWidget(QOpenGLWidget):
                     return value
             value = int(primary[index])
             return value if 0 <= value < len(names) and palette_solid[value] else -1
-        mesh = []
+
+        faces = []
         for raw_idx in candidates:
             idx = int(raw_idx)
             pidx = block_at(idx)
             if pidx < 0:
                 continue
-            x = idx // (sy * sz); y = (idx // sz) % sy; z = idx % sz
-            c = block_color(names[pidx])
-            # Faces are emitted only when the adjacent voxel is empty.
+            x = idx // (sy * sz)
+            y = (idx // sz) % sy
+            z = idx % sz
+            color = block_color(names[pidx])
+            # Keep all six exposed directions; the active camera hides back-facing sides.
             if y + 1 >= sy or block_at(idx + sz) < 0:
-                mesh.append((x, y, z, c, "top"))
+                faces.append((x, y, z, color, "top"))
+            if y <= 0 or block_at(idx - sz) < 0:
+                faces.append((x, y, z, color, "bottom"))
             if x + 1 >= sx or block_at(idx + sy * sz) < 0:
-                mesh.append((x, y, z, c, "right"))
+                faces.append((x, y, z, color, "px"))
+            if x <= 0 or block_at(idx - sy * sz) < 0:
+                faces.append((x, y, z, color, "nx"))
             if z + 1 >= sz or block_at(idx + 1) < 0:
-                mesh.append((x, y, z, c, "left"))
-        self._mesh_cache[key] = (src.size, mesh)
-        return src.size, mesh
+                faces.append((x, y, z, color, "pz"))
+            if z <= 0 or block_at(idx - 1) < 0:
+                faces.append((x, y, z, color, "nz"))
+        result = (src.size, faces)
+        self._mesh_cache[key] = result
+        return result
 
     def _projected_paths(self, row):
-        key = (row["id"], row["rotation"], row["mirror_x"], row["mirror_z"])
+        yaw = round(math.degrees(self.yaw) / 2.0) * 2.0
+        pitch = round(math.degrees(self.pitch) / 2.0) * 2.0
+        key = (row["id"], row["rotation"], row["mirror_x"], row["mirror_z"], yaw, pitch)
         cached = self._path_cache.get(key)
         if cached is not None:
             return cached
-        _size, mesh = self._structure_mesh(row)
+
+        _size, faces = self._structure_mesh(row)
+        yaw_rad = math.radians(yaw)
+        pitch_rad = math.radians(pitch)
+        yaw_s, yaw_c = math.sin(yaw_rad), math.cos(yaw_rad)
         buckets = {}
         from PySide6.QtCore import QPointF
-        for x, y, z, base, face in mesh:
-            if face == "top":
-                points = [((x-z)*6.5, (x+z)*3.5-(y+1)*13),
-                          ((x+1-z)*6.5, (x+1+z)*3.5-(y+1)*13),
-                          ((x+1-z-1)*6.5, (x+1+z+1)*3.5-(y+1)*13),
-                          ((x-z-1)*6.5, (x+z+1)*3.5-(y+1)*13)]
-                shade = 1.12
-            elif face == "right":
-                points = [((x+1-z)*6.5, (x+1+z)*3.5-y*13),
-                          ((x+1-z)*6.5, (x+1+z)*3.5-(y+1)*13),
-                          ((x-z)*6.5, (x+z+2)*3.5-(y+1)*13),
-                          ((x-z)*6.5, (x+z+2)*3.5-y*13)]
-                shade = .72
-            else:
-                points = [((x-z-1)*6.5, (x+z+1)*3.5-y*13),
-                          ((x-z-1)*6.5, (x+z+1)*3.5-(y+1)*13),
-                          ((x+1-z-1)*6.5, (x+1+z+1)*3.5-(y+1)*13),
-                          ((x+1-z-1)*6.5, (x+1+z+1)*3.5-y*13)]
-                shade = .88
-            color = QColor(min(255,int(base.red()*shade)),min(255,int(base.green()*shade)),min(255,int(base.blue()*shade))).name()
-            depth = x + z + y
+
+        face_vertices = {
+            "top":    ((0,1,0),(1,1,0),(1,1,1),(0,1,1)),
+            "bottom": ((0,0,1),(1,0,1),(1,0,0),(0,0,0)),
+            "px":     ((1,0,0),(1,1,0),(1,1,1),(1,0,1)),
+            "nx":     ((0,0,1),(0,1,1),(0,1,0),(0,0,0)),
+            "pz":     ((0,0,1),(0,1,1),(1,1,1),(1,0,1)),
+            "nz":     ((1,0,0),(1,1,0),(0,1,0),(0,0,0)),
+        }
+        shades = {"top":1.12, "bottom":0.48, "px":0.72, "nx":0.78, "pz":0.88, "nz":0.80}
+        visible = {
+            "top": True,
+            "bottom": False,
+            "px": yaw_s > 0.001,
+            "nx": yaw_s < -0.001,
+            "pz": yaw_c > 0.001,
+            "nz": yaw_c < -0.001,
+        }
+        root2 = math.sqrt(2.0)
+        pitch_factor = math.sin(pitch_rad) / math.sin(math.radians(32.0))
+        vertical_factor = math.cos(pitch_rad) / math.cos(math.radians(32.0))
+
+        def project(x, y, z):
+            px = 6.5 * root2 * (x * yaw_c - z * yaw_s)
+            py = 3.5 * root2 * (x * yaw_s + z * yaw_c) * pitch_factor - 13.0 * y * vertical_factor
+            return px, py
+
+        for x, y, z, base, face in faces:
+            if not visible[face]:
+                continue
+            verts = face_vertices[face]
+            points = [project(x+vx, y+vy, z+vz) for vx,vy,vz in verts]
+            shade = shades[face]
+            color = QColor(
+                min(255, int(base.red()*shade)),
+                min(255, int(base.green()*shade)),
+                min(255, int(base.blue()*shade)),
+            ).name()
+            depth = int(round((x + 0.5) * yaw_s * 4 + (z + 0.5) * yaw_c * 4 - (y + 0.5) * 1.2))
             path = buckets.setdefault(depth, {}).setdefault(color, QPainterPath())
             path.moveTo(QPointF(*points[0]))
             for point in points[1:]:
                 path.lineTo(QPointF(*point))
             path.closeSubpath()
+
         self._path_cache[key] = buckets
+        # Keep camera-angle variants bounded while the user orbits continuously.
+        if len(self._path_cache) > max(24, len(self.window.rows) * 8):
+            self._path_cache.clear()
+            self._path_cache[key] = buckets
         return buckets
 
     def paintGL(self):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         bg = QColor("#10151d") if self.window.theme == "dark" else QColor("#e9eef5")
-        p.fillRect(self.rect(), bg)
+        painter.fillRect(self.rect(), bg)
         if not self.window.rows:
-            p.setPen(QColor("#9aa6b8"))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "「ファイルを追加」から .mcstructure / ZIP を読み込んでください")
-            p.end()
+            painter.setPen(QColor("#9aa6b8"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                             "「ファイルを追加」から .mcstructure / ZIP を読み込んでください")
+            painter.end()
             return
         if self.mode == "top":
-            self._paint_top(p)
+            self._paint_top(painter)
         else:
-            self._paint_iso(p)
-        p.end()
+            self._paint_iso(painter)
+        painter.end()
 
     def _top_image(self, row):
         key = (row["id"], row["rotation"], row["mirror_x"], row["mirror_z"])
@@ -223,8 +328,6 @@ class PreviewWidget(QOpenGLWidget):
             return cached
         src = core.transform_loaded_structure(row["loaded"], row["rotation"], row["mirror_x"], row["mirror_z"])
         sx, sy, sz = src.size
-        # Bound the raster to ~1.5M samples so very wide structures cannot
-        # allocate a viewport-sized array or stall the UI.
         step = max(1, int(math.ceil(math.sqrt((sx * sz) / 1500000))))
         names = palette_names(src)
         palette_solid = np.ones(len(names), dtype=np.bool_)
@@ -236,13 +339,13 @@ class PreviewWidget(QOpenGLWidget):
         pvalid = (primary >= 0) & (primary < len(names))
         solid0 = pvalid & palette_solid[np.clip(primary, 0, len(names)-1)]
         secondary = None
-        solid1 = None
         if len(src.layers) > 1:
             secondary = np.frombuffer(src.layers[1], dtype=np.int32).reshape((sx, sy, sz))[::step, :, ::step]
             svalid = (secondary >= 0) & (secondary < len(names))
             solid1 = svalid & palette_solid[np.clip(secondary, 0, len(names)-1)]
             solid = solid0 | solid1
         else:
+            solid1 = None
             solid = solid0
         has_block = solid.any(axis=1)
         top_y = sy - 1 - solid[:, ::-1, :].argmax(axis=1)
@@ -255,109 +358,267 @@ class PreviewWidget(QOpenGLWidget):
         rgba[has_block, :3] = palette_rgb[pidx[has_block]]
         rgba[has_block, 3] = 255
         raster = np.transpose(rgba, (1, 0, 2)).copy()
-        image = QImage(raster.data, raster.shape[1], raster.shape[0], raster.shape[1] * 4, QImage.Format.Format_RGBA8888).copy()
+        image = QImage(raster.data, raster.shape[1], raster.shape[0],
+                       raster.shape[1] * 4, QImage.Format.Format_RGBA8888).copy()
         self._top_cache[key] = image
         return image
 
-    def _paint_top(self, p):
-        rows = self.window.rows
-        bounds = []
-        for r in rows:
-            sx, sy, sz = self.window.dimensions(r)
-            bounds.append((r["x"], r["z"], sx, sz, r))
-        minx = min(v[0] for v in bounds); minz = min(v[1] for v in bounds)
-        maxx = max(v[0] + v[2] for v in bounds); maxz = max(v[1] + v[3] for v in bounds)
-        spanx = max(1, maxx-minx); spanz = max(1, maxz-minz)
-        scale = min((self.width()-80)/spanx, (self.height()-80)/spanz) * self.zoom
-        scale = max(0.015, min(scale, 24.0))
-        ox = (self.width()-spanx*scale)/2 - minx*scale + self.pan_x
-        oy = (self.height()-spanz*scale)/2 - minz*scale + self.pan_y
-        p.setPen(QPen(QColor("#667085"), 1))
-        grid = 64 * scale
-        if grid >= 8:
-            gx = math.floor((minx-ox/scale)/64)*64
-            gz = math.floor((minz-oy/scale)/64)*64
-            p.setPen(QPen(QColor(130,145,165,45), 1))
-            for x in range(int(gx), int(maxx+100), 64):
-                px=ox+x*scale; p.drawLine(int(px),0,int(px),self.height())
-            for z in range(int(gz), int(maxz+100), 64):
-                py=oy+z*scale; p.drawLine(0,int(py),self.width(),int(py))
-        for x,z,sx,sz,r in bounds:
-            rect = (ox+x*scale, oy+z*scale, sx*scale, sz*scale)
-            image = self._top_image(r)
-            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
-            p.drawImage(QRectF(*rect), image)
-            color = QColor("#dc5555") if self.window.overlaps(r) else QColor("#4f8edb")
-            p.setPen(QPen(color, 3 if r["id"] == self.window.selected_id else 2))
-            p.drawRect(QRectF(*rect))
-            if rect[2] > 70 and rect[3] > 30:
-                p.setPen(QColor("#f2f4f7") if self.window.theme=="dark" else QColor("#344054"))
-                p.drawText(int(rect[0]+5),int(rect[1]+19),Path(r["display_path"]).name)
-        p.setPen(QColor("#aab5c5"))
-        p.drawText(12,self.height()-12,f"上面図  |  範囲 {spanx} × {spanz} blocks  |  64ブロックグリッド")
-
-    def _paint_iso(self, p):
-        if not self.window.rows:
-            return
-        bounds = []
+    def _paint_top(self, painter):
+        entries = []
         for row in self.window.rows:
-            sx, sy, sz = self.window.dimensions(row)
-            bounds.append((row, sx, sy, sz))
-        minx = min(r["x"] for r, *_ in bounds); miny = min(r["y"] for r, *_ in bounds); minz = min(r["z"] for r, *_ in bounds)
-        maxx = max(r["x"]+sx for r,sx,sy,sz in bounds); maxy = max(r["y"]+sy for r,sx,sy,sz in bounds); maxz = max(r["z"]+sz for r,sx,sy,sz in bounds)
-        cx=(minx+maxx)/2; cy=(miny+maxy)/2; cz=(minz+maxz)/2
-        base_x=(cx-cz)*6.5
-        base_y=(cx+cz)*3.5-cy*13
-        for row, _sx, _sy, _sz in bounds:
+            sx, _sy, sz = self.window.dimensions(row)
+            entries.append((row["x"], row["z"], sx, sz, row))
+        minx = min(item[0] for item in entries)
+        minz = min(item[1] for item in entries)
+        maxx = max(item[0] + item[2] for item in entries)
+        maxz = max(item[1] + item[3] for item in entries)
+        spanx = max(1, maxx - minx)
+        spanz = max(1, maxz - minz)
+        transform = self._top_transform()
+        scale, ox, oy = transform["scale"], transform["ox"], transform["oy"]
+
+        grid_step = max(64, 64 * int(math.ceil(max(spanx, spanz) / 64 / 120)))
+        left_world = (-ox) / scale
+        right_world = (self.width() - ox) / scale
+        top_world = (-oy) / scale
+        bottom_world = (self.height() - oy) / scale
+        gx0 = math.floor(left_world / grid_step) * grid_step
+        gz0 = math.floor(top_world / grid_step) * grid_step
+        painter.setPen(QPen(QColor(130,145,165,45), 1))
+        for x in range(int(gx0), int(right_world) + grid_step, grid_step):
+            px = ox + x * scale
+            painter.drawLine(int(px), 0, int(px), self.height())
+        for z in range(int(gz0), int(bottom_world) + grid_step, grid_step):
+            py = oy + z * scale
+            painter.drawLine(0, int(py), self.width(), int(py))
+
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        for x, z, sx, sz, row in entries:
+            rect = QRectF(ox+x*scale, oy+z*scale, sx*scale, sz*scale)
+            painter.drawImage(rect, self._top_image(row))
+            color = QColor("#dc5555") if self.window.overlaps(row) else QColor("#4f8edb")
+            painter.setPen(QPen(color, 3 if row["id"] == self.window.selected_id else 2))
+            painter.drawRect(rect)
+            if rect.width() > 70 and rect.height() > 30:
+                painter.setPen(QColor("#f2f4f7") if self.window.theme == "dark" else QColor("#344054"))
+                painter.drawText(int(rect.x()+5), int(rect.y()+19), Path(row["display_path"]).name)
+        painter.setPen(QColor("#aab5c5"))
+        painter.drawText(12, self.height()-12,
+                         f"上面図 | 左ドラッグ: 選択物を移動（64スナップ） | 右ドラッグ: 画面移動 | ホイール: ズーム")
+
+    def _paint_iso(self, painter):
+        transform = self._iso_transform()
+        scale, ox, oy = transform["scale"], transform["ox"], transform["oy"]
+        for row in self.window.rows:
             buckets = self._projected_paths(row)
-            p.save()
-            p.translate(self.width()/2+self.pan_x-base_x, self.height()/2+self.pan_y-base_y)
-            p.scale(self.zoom,self.zoom)
-            p.translate((row["x"]-row["z"])*6.5, (row["x"]+row["z"])*3.5-row["y"]*13)
+            px, py = self._project_raw(row["x"], row["y"], row["z"])
+            painter.save()
+            painter.translate(ox + px*scale, oy + py*scale)
+            painter.scale(scale, scale)
             for depth in sorted(buckets):
-                for color,path in buckets[depth].items():
-                    p.setPen(QPen(QColor("#151a22") if self.window.theme=="dark" else QColor("#64748b"),0.35))
-                    p.setBrush(QBrush(QColor(color)))
-                    p.drawPath(path)
-            p.restore()
-        p.setPen(QColor("#aab5c5"))
-        p.drawText(12,self.height()-12,"簡易3D  |  露出面のみ描画・形状キャッシュ  |  近似マテリアル")
+                for color, path in buckets[depth].items():
+                    painter.setPen(QPen(QColor("#151a22") if self.window.theme == "dark" else QColor("#64748b"), 0.35))
+                    painter.setBrush(QBrush(QColor(color)))
+                    painter.drawPath(path)
+            painter.restore()
 
-    def mousePressEvent(self,e):
-        if e.button()==Qt.MouseButton.RightButton:
-            self._pan=(e.position().x(),e.position().y(),self.pan_x,self.pan_y); self.setCursor(Qt.CursorShape.ClosedHandCursor)
-        elif e.button()==Qt.MouseButton.LeftButton:
-            self._drag=(e.position().x(),e.position().y(),self.window.selected_id)
-        super().mousePressEvent(e)
+            # Outline the projected bounds so a selected structure remains easy to find.
+            if row["id"] == self.window.selected_id:
+                sx, sy, sz = self.window.dimensions(row)
+                corners = [(x,y,z) for x in (0,sx) for y in (0,sy) for z in (0,sz)]
+                points = [self._project_raw(row["x"]+x,row["y"]+y,row["z"]+z) for x,y,z in corners]
+                points = [(ox+x*scale, oy+y*scale) for x,y in points]
+                if points:
+                    from PySide6.QtGui import QPolygonF
+                    from PySide6.QtCore import QPointF
+                    polygon = QPolygonF([QPointF(x,y) for x,y in points])
+                    painter.setPen(QPen(QColor("#f5b942"), 1.8, Qt.PenStyle.DashLine))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawPolygon(polygon.boundingRect())
 
-    def mouseMoveEvent(self,e):
-        if self._pan:
-            x,y,px,py=self._pan; self.pan_x=px+e.position().x()-x; self.pan_y=py+e.position().y()-y; self.update()
-        super().mouseMoveEvent(e)
+        painter.setPen(QColor("#aab5c5"))
+        painter.drawText(12, self.height()-12,
+                         "3D | 左ドラッグ: 視点回転 | Shift+左ドラッグ: 選択物を移動 | 右ドラッグ: 画面移動 | ホイール: ズーム")
 
-    def mouseReleaseEvent(self,e):
-        if self._pan:
-            self._pan=None; self.unsetCursor()
-        elif self._drag and e.button()==Qt.MouseButton.LeftButton:
-            sx,sy,selected=self._drag; dx=e.position().x()-sx; dy=e.position().y()-sy
-            if abs(dx)+abs(dy)<5:
-                self.window.select_at(e.position().x(),e.position().y(),self.mode)
-            elif selected is not None and self.mode=="top":
-                row=self.window.row_by_id(selected)
-                if row:
-                    dim=self.window.dimensions(row)
-                    scale=min((self.width()-80)/max(1,self.window.bounds()[2]),(self.height()-80)/max(1,self.window.bounds()[3]))*self.zoom
-                    if scale>0:
-                        row["x"]=int(round((row["x"]+dx/scale)/64))*64
-                        row["z"]=int(round((row["z"]+dy/scale)/64))*64
-                        self.window.changed("64ブロック単位で移動しました")
-            self._drag=None
+    def _hit_test_top(self, px, py):
+        transform = self._top_transform()
+        scale, ox, oy = transform["scale"], transform["ox"], transform["oy"]
+        for row in reversed(self.window.rows):
+            sx, _sy, sz = self.window.dimensions(row)
+            left = ox + row["x"] * scale
+            top = oy + row["z"] * scale
+            if left <= px <= left + sx*scale and top <= py <= top + sz*scale:
+                return row
+        return None
+
+    def _hit_test_iso(self, px, py):
+        transform = self._iso_transform()
+        scale, ox, oy = transform["scale"], transform["ox"], transform["oy"]
+        for row in reversed(self.window.rows):
+            sx, sy, sz = self.window.dimensions(row)
+            points = [self._project_raw(row["x"]+x,row["y"]+y,row["z"]+z)
+                      for x in (0,sx) for y in (0,sy) for z in (0,sz)]
+            screen = [(ox+x*scale, oy+y*scale) for x,y in points]
+            if not screen:
+                continue
+            left = min(v[0] for v in screen)
+            right = max(v[0] for v in screen)
+            top = min(v[1] for v in screen)
+            bottom = max(v[1] for v in screen)
+            if left <= px <= right and top <= py <= bottom:
+                return row
+        return None
+
+    def _select_hit(self, px, py):
+        row = self._hit_test_top(px, py) if self.mode == "top" else self._hit_test_iso(px, py)
+        if row is not None:
+            self.window.select_row(row["id"])
+        return row
+
+    def mousePressEvent(self, event):
+        self.setFocus()
+        px, py = event.position().x(), event.position().y()
+        if event.button() in (Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton):
+            self._gesture = {
+                "mode": "pan", "start_x": px, "start_y": py,
+                "pan_x": self.pan_x, "pan_y": self.pan_y,
+            }
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+
+        if event.button() == Qt.MouseButton.LeftButton:
+            modifiers = event.modifiers()
+            if self.mode == "top":
+                hit = self._hit_test_top(px, py)
+                if hit is not None and hit["id"] != self.window.selected_id:
+                    self.window.select_row(hit["id"])
+                    self._gesture = {"mode":"select", "start_x":px, "start_y":py}
+                elif hit is not None:
+                    self._gesture = {
+                        "mode":"move_top", "row_id":hit["id"], "start_x":px, "start_y":py,
+                        "world_x":hit["x"], "world_z":hit["z"],
+                        "transform":dict(self._top_transform()),
+                    }
+                    self._active_top_transform = self._gesture["transform"]
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                else:
+                    self._gesture = {"mode":"empty", "start_x":px, "start_y":py}
+            elif modifiers & Qt.KeyboardModifier.ShiftModifier:
+                hit = self._hit_test_iso(px, py)
+                if hit is not None and hit["id"] != self.window.selected_id:
+                    self.window.select_row(hit["id"])
+                    self._gesture = {"mode":"select", "start_x":px, "start_y":py}
+                elif hit is not None:
+                    self._gesture = {
+                        "mode":"move_iso", "row_id":hit["id"], "start_x":px, "start_y":py,
+                        "world_x":hit["x"], "world_z":hit["z"],
+                        "transform":dict(self._iso_transform()),
+                        "yaw":self.yaw, "pitch":self.pitch,
+                    }
+                    self._active_iso_transform = self._gesture["transform"]
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                else:
+                    self._gesture = {"mode":"select", "start_x":px, "start_y":py}
+            else:
+                self._gesture = {
+                    "mode":"orbit", "start_x":px, "start_y":py,
+                    "yaw":self.yaw, "pitch":self.pitch,
+                }
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self._gesture:
+            super().mouseMoveEvent(event)
+            return
+        px, py = event.position().x(), event.position().y()
+        state = self._gesture
+        dx, dy = px - state["start_x"], py - state["start_y"]
+        mode = state["mode"]
+
+        if mode == "pan":
+            self.pan_x = state["pan_x"] + dx
+            self.pan_y = state["pan_y"] + dy
+        elif mode == "orbit":
+            self.yaw = state["yaw"] + dx * 0.012
+            self.pitch = max(math.radians(12), min(math.radians(78), state["pitch"] - dy * 0.009))
+        elif mode == "move_top":
+            row = self.window.row_by_id(state["row_id"])
+            if row is not None:
+                scale = state["transform"]["scale"]
+                row["x"] = int(round(state["world_x"] + dx / scale))
+                row["z"] = int(round(state["world_z"] + dy / scale))
+        elif mode == "move_iso":
+            row = self.window.row_by_id(state["row_id"])
+            if row is not None:
+                scale = max(0.001, state["transform"]["scale"])
+                yaw = state["yaw"]
+                pitch = state["pitch"]
+                root2 = math.sqrt(2.0)
+                kx = 6.5 * root2
+                kz = 3.5 * root2 * math.sin(pitch) / math.sin(math.radians(32.0))
+                a = kx * math.cos(yaw)
+                b = -kx * math.sin(yaw)
+                c = kz * math.sin(yaw)
+                d = kz * math.cos(yaw)
+                det = a*d - b*c
+                if abs(det) > 1e-8:
+                    screen_dx, screen_dy = dx/scale, dy/scale
+                    world_dx = (screen_dx*d - b*screen_dy) / det
+                    world_dz = (a*screen_dy - c*screen_dx) / det
+                    row["x"] = int(round(state["world_x"] + world_dx))
+                    row["z"] = int(round(state["world_z"] + world_dz))
+        if mode in ("pan","orbit","move_top","move_iso"):
+            self.update()
+            if mode in ("move_top","move_iso"):
+                self.window.statusBar().showMessage("ドラッグ中… 離すと64ブロック単位にスナップ")
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        state = self._gesture
+        if state is None:
+            super().mouseReleaseEvent(event)
+            return
+        px, py = event.position().x(), event.position().y()
+        dx = px - state["start_x"]
+        dy = py - state["start_y"]
+        mode = state["mode"]
+        self._gesture = None
+        self._active_top_transform = None
+        self._active_iso_transform = None
+        self.unsetCursor()
+
+        if mode == "move_top":
+            row = self.window.row_by_id(state["row_id"])
+            if row is not None:
+                row["x"] = self._snap64(row["x"])
+                row["z"] = self._snap64(row["z"])
+                self.window.changed("上面図から構造物を移動しました（64ブロック単位）")
+        elif mode == "move_iso":
+            row = self.window.row_by_id(state["row_id"])
+            if row is not None:
+                row["x"] = self._snap64(row["x"])
+                row["z"] = self._snap64(row["z"])
+                self.window.changed("3Dプレビューから構造物を移動しました（64ブロック単位）")
+        elif mode == "orbit":
+            if abs(dx) + abs(dy) < 5:
+                self._select_hit(px, py)
+            self.window.save_timer.start()
+        elif mode == "pan":
+            self.window.save_timer.start()
+        elif mode == "select" and abs(dx) + abs(dy) < 5:
+            self._select_hit(px, py)
         self.update()
-        super().mouseReleaseEvent(e)
+        event.accept()
 
-    def wheelEvent(self,e):
-        factor=1.15 if e.angleDelta().y()>0 else 1/1.15
-        self.zoom=max(.08,min(8.0,self.zoom*factor)); self.update()
+    def wheelEvent(self, event):
+        factor = 1.15 if event.angleDelta().y() > 0 else 1/1.15
+        self.zoom = max(0.08, min(16.0, self.zoom * factor))
+        self.update()
+        self.window.save_timer.start()
+        event.accept()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -388,7 +649,15 @@ class MainWindow(QMainWindow):
         action("連続配置",self.repeat_dialog)
         action("保存・結合",self.merge)
         toolbar.addSeparator()
-        self.undo_action=action("↶ 元に戻す",self.undo); self.redo_action=action("↷ やり直す",self.redo)
+        self.undo_action=action("↶ 元に戻す  Ctrl+Z",self.undo)
+        self.undo_action.setShortcut("Ctrl+Z")
+        self.undo_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.redo_action=action("↷ やり直す  Ctrl+Y",self.redo)
+        self.redo_action.setShortcut("Ctrl+Y")
+        self.redo_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        toolbar.addSeparator()
+        action("↻ 選択を90°回転",self.rotate_group)
+        action("↺ 選択を90°戻す",self.rotate_group_ccw)
         toolbar.addSeparator()
         self.theme_action=action("☼ ライト／ダーク",self.toggle_theme)
         central=QWidget(); root=QVBoxLayout(central); root.setContentsMargins(14,12,14,12); root.setSpacing(10)
@@ -418,7 +687,7 @@ class MainWindow(QMainWindow):
         form.addRow(self.mx); form.addRow(self.mz); rl.addLayout(form)
         self.apply_btn=QPushButton("変更を適用"); self.apply_btn.clicked.connect(self.apply_properties); rl.addWidget(self.apply_btn)
         rl.addWidget(QLabel("グループ操作"))
-        for label,fn in [("選択を移動…",self.move_group),("90°グループ回転",self.rotate_group),("Xミラー",lambda:self.mirror_group("x")),("Zミラー",lambda:self.mirror_group("z")),("X左揃え",lambda:self.align_group("x")),("Z手前揃え",lambda:self.align_group("z")),("中央揃え",lambda:self.align_group("center"))]:
+        for label,fn in [("選択を移動…",self.move_group),("選択を90°回転",self.rotate_group),("選択を90°戻す",self.rotate_group_ccw),("Xミラー",lambda:self.mirror_group("x")),("Zミラー",lambda:self.mirror_group("z")),("X左揃え",lambda:self.align_group("x")),("Z手前揃え",lambda:self.align_group("z")),("中央揃え",lambda:self.align_group("center"))]:
             b=QPushButton(label); b.clicked.connect(fn); rl.addWidget(b)
         rl.addSpacing(8); rl.addWidget(QLabel("重なりルール"))
         self.overlap=QComboBox()
@@ -515,6 +784,23 @@ class MainWindow(QMainWindow):
             self.selected_id=item.data(Qt.ItemDataRole.UserRole)
             self.update_properties()
 
+    def select_row(self, instance_id):
+        row = self.row_by_id(instance_id)
+        if row is None:
+            return
+        self.selected_id = instance_id
+        self.list.blockSignals(True)
+        self.list.clearSelection()
+        for index in range(self.list.count()):
+            item = self.list.item(index)
+            if item.data(Qt.ItemDataRole.UserRole) == instance_id:
+                item.setSelected(True)
+                self.list.setCurrentItem(item)
+                break
+        self.list.blockSignals(False)
+        self.update_properties()
+        self.preview.update()
+
     def update_properties(self):
         r=self.row_by_id(self.selected_id) if self.selected_id else None
         for w in (self.xbox,self.ybox,self.zbox,self.rot,self.mx,self.mz,self.apply_btn):
@@ -579,16 +865,33 @@ class MainWindow(QMainWindow):
             r["x"]+=delta[0]; r["y"]+=delta[1]; r["z"]+=delta[2]
         self.refresh_list(); self.changed("選択した構造物をまとめて移動しました")
 
+    def _rotate_selected_group(self, direction):
+        selected = self.selected_rows()
+        if not selected:
+            return
+        minx = min(r["x"] for r in selected)
+        minz = min(r["z"] for r in selected)
+        maxx = max(r["x"] + self.dimensions(r)[0] for r in selected)
+        maxz = max(r["z"] + self.dimensions(r)[2] for r in selected)
+        for row in selected:
+            oldx, oldz = row["x"], row["z"]
+            sx, _sy, sz = self.dimensions(row)
+            if direction > 0:
+                row["x"] = minx + (maxz - oldz - sz)
+                row["z"] = minz + (oldx - minx)
+                row["rotation"] = (row["rotation"] + 90) % 360
+            else:
+                row["x"] = minx + (oldz - minz)
+                row["z"] = minz + (maxx - oldx - sx)
+                row["rotation"] = (row["rotation"] - 90) % 360
+        self.refresh_list()
+        self.changed("選択した構造物を90°回転しました" if direction > 0 else "選択した構造物を90°戻しました")
+
     def rotate_group(self):
-        selected=self.selected_rows()
-        if not selected:return
-        minx=min(r["x"] for r in selected); minz=min(r["z"] for r in selected)
-        maxx=max(r["x"]+self.dimensions(r)[0] for r in selected); maxz=max(r["z"]+self.dimensions(r)[2] for r in selected)
-        for r in selected:
-            oldx,oldz=r["x"],r["z"]; sx,_,sz=self.dimensions(r)
-            r["x"]=minx+(maxz-oldz-sz); r["z"]=minz+(oldx-minx)
-            r["rotation"]=(r["rotation"]+90)%360
-        self.refresh_list(); self.changed("グループを90°回転しました")
+        self._rotate_selected_group(1)
+
+    def rotate_group_ccw(self):
+        self._rotate_selected_group(-1)
 
     def mirror_group(self,axis):
         selected=self.selected_rows()
@@ -640,7 +943,12 @@ class MainWindow(QMainWindow):
         del self._history[self._history_index+1:]; self._history.append(s)
         if len(self._history)>60:self._history.pop(0)
         self._history_index=len(self._history)-1
-        if hasattr(self,"undo_action"):self.undo_action.setEnabled(self._history_index>0); self.redo_action.setEnabled(False)
+        self._update_history_actions()
+
+    def _update_history_actions(self):
+        if hasattr(self, "undo_action"):
+            self.undo_action.setEnabled(self._history_index > 0)
+            self.redo_action.setEnabled(self._history_index < len(self._history) - 1)
 
     def apply_state(self,s):
         records,overlap=s; self.overlap_mode=overlap; self.rows=[]
@@ -659,11 +967,13 @@ class MainWindow(QMainWindow):
     def undo(self):
         if self._history_index>0:
             self._history_index-=1; self.apply_state(self._history[self._history_index]); self.statusBar().showMessage("元に戻しました")
-            self.undo_action.setEnabled(self._history_index>0); self.redo_action.setEnabled(True)
+            self._update_history_actions()
 
     def redo(self):
         if self._history_index+1<len(self._history):
-            self._history_index+=1; self.apply_state(self._history[self._history_index]); self.undo_action.setEnabled(self._history_index>0); self.redo_action.setEnabled(self._history_index+1<len(self._history)-1)
+            self._history_index+=1
+            self.apply_state(self._history[self._history_index])
+            self._update_history_actions()
 
     def cache_source(self,path):
         h=hashlib.sha256(Path(path).read_bytes()).hexdigest(); target=self.sources_dir/f"{h}.mcstructure"
@@ -677,7 +987,8 @@ class MainWindow(QMainWindow):
             for r in self.rows:
                 cached=self.cache_source(r["path"])
                 records.append({"instance_id":r["id"],"source_cache":os.path.relpath(cached,self.data_dir),"display_path":r["display_path"],"x":r["x"],"y":r["y"],"z":r["z"],"rotation":r["rotation"],"mirror_x":r["mirror_x"],"mirror_z":r["mirror_z"]})
-            payload={"format":"mcstructure-merger-autosave","version":1,"saved_at":__import__("datetime").datetime.now().isoformat(timespec="seconds"),"overlap_mode":self.overlap_mode,"selected_ids":[self.selected_id] if self.selected_id else [],"rows":records}
+            payload={"format":"mcstructure-merger-autosave","version":1,"saved_at":__import__("datetime").datetime.now().isoformat(timespec="seconds"),"overlap_mode":self.overlap_mode,"selected_ids":[self.selected_id] if self.selected_id else [],"rows":records,
+                     "preview":{"mode":self.preview.mode,"zoom":self.preview.zoom,"pan_x":self.preview.pan_x,"pan_y":self.preview.pan_y,"yaw":self.preview.yaw,"pitch":self.preview.pitch}}
             tmp=self.autosave_file.with_suffix(".json.tmp")
             with open(tmp,"w",encoding="utf-8") as f:json.dump(payload,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
             os.replace(tmp,self.autosave_file)
@@ -701,6 +1012,14 @@ class MainWindow(QMainWindow):
             self.overlap.setCurrentIndex(max(0,self.overlap.findData(self.overlap_mode)))
             self.overlap.blockSignals(False)
             self.selected_id=self.rows[0]["id"] if self.rows else None
+            view = payload.get("preview", {})
+            self.preview.zoom = max(0.08, min(16.0, float(view.get("zoom", 1.0))))
+            self.preview.pan_x = float(view.get("pan_x", 0.0))
+            self.preview.pan_y = float(view.get("pan_y", 0.0))
+            self.preview.yaw = float(view.get("yaw", math.radians(45.0)))
+            self.preview.pitch = max(math.radians(12), min(math.radians(78), float(view.get("pitch", math.radians(32.0)))))
+            self.preview.mode = view.get("mode", "3d") if view.get("mode", "3d") in ("3d", "top") else "3d"
+            self.mode_combo.setCurrentIndex(0 if self.preview.mode == "3d" else 1)
             self.refresh_list()
             if self.rows:self.statusBar().showMessage(f"前回の作業を{len(self.rows)}件復元しました",6000)
         except Exception as e:QMessageBox.warning(self,"自動復元",f"前回の作業を復元できませんでした。\n{e}")
