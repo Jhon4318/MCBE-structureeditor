@@ -429,12 +429,12 @@ class PreviewWidget(QOpenGLWidget):
                 points = [self._project_raw(row["x"]+x,row["y"]+y,row["z"]+z) for x,y,z in corners]
                 points = [(ox+x*scale, oy+y*scale) for x,y in points]
                 if points:
-                    from PySide6.QtGui import QPolygonF
                     from PySide6.QtCore import QPointF
+                    from PySide6.QtGui import QPolygonF
                     polygon = QPolygonF([QPointF(x,y) for x,y in points])
                     painter.setPen(QPen(QColor("#f5b942"), 1.8, Qt.PenStyle.DashLine))
                     painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawPolygon(polygon.boundingRect())
+                    painter.drawRect(polygon.boundingRect())
 
         painter.setPen(QColor("#aab5c5"))
         painter.drawText(12, self.height()-12,
