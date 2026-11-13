@@ -54,7 +54,7 @@ jobs:
       - name: Build standalone GUI executable
         shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name MCBE-StructureEditor --distpath dist --workpath build/pyinstaller --collect-all PySide6 --collect-all shiboken6 --collect-all numpy --hidden-import=PySide6.QtOpenGLWidgets mcstructure_editor_qt.py
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name MCBE-StructureEditor --distpath dist --workpath build/pyinstaller --hidden-import=PySide6.QtOpenGLWidgets mcstructure_editor_qt.py
           if (!(Test-Path "dist/MCBE-StructureEditor.exe")) {
             throw "PyInstaller did not create dist/MCBE-StructureEditor.exe"
           }
