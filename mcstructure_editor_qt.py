@@ -395,7 +395,7 @@ class MainWindow(QMainWindow):
         form.addRow(self.mx); form.addRow(self.mz); rl.addLayout(form)
         self.apply_btn=QPushButton("変更を適用"); self.apply_btn.clicked.connect(self.apply_properties); rl.addWidget(self.apply_btn)
         rl.addWidget(QLabel("グループ操作"))
-        for label,fn in [("90°グループ回転",self.rotate_group),("Xミラー",lambda:self.mirror_group("x")),("Zミラー",lambda:self.mirror_group("z")),("X左揃え",lambda:self.align_group("x")),("Z手前揃え",lambda:self.align_group("z")),("中央揃え",lambda:self.align_group("center"))]:
+        for label,fn in [("選択を移動…",self.move_group),("90°グループ回転",self.rotate_group),("Xミラー",lambda:self.mirror_group("x")),("Zミラー",lambda:self.mirror_group("z")),("X左揃え",lambda:self.align_group("x")),("Z手前揃え",lambda:self.align_group("z")),("中央揃え",lambda:self.align_group("center"))]:
             b=QPushButton(label); b.clicked.connect(fn); rl.addWidget(b)
         rl.addSpacing(8); rl.addWidget(QLabel("重なりルール"))
         self.overlap=QComboBox()
@@ -540,6 +540,21 @@ class MainWindow(QMainWindow):
             clone=copy.copy(r); clone["id"]=self._next_id; self._next_id+=1; clone["x"],clone["y"],clone["z"]=pos
             self.rows.append(clone)
         self.refresh_list(); self.changed(f"{count}個に連続配置しました")
+
+    def move_group(self):
+        selected=self.selected_rows()
+        if not selected:return
+        value,ok=QInputDialog.getText(self,"選択した構造物を移動","移動量を X,Y,Z の順で入力（例: 64,0,-64）","0,0,0")
+        if not ok:return
+        try:
+            delta=tuple(int(part.strip()) for part in value.split(","))
+            if len(delta)!=3:raise ValueError("X,Y,Zの3つを入力してください")
+        except Exception:
+            QMessageBox.warning(self,"入力エラー","移動量は整数3個をカンマ区切りで入力してください。")
+            return
+        for r in selected:
+            r["x"]+=delta[0]; r["y"]+=delta[1]; r["z"]+=delta[2]
+        self.refresh_list(); self.changed("選択した構造物をまとめて移動しました")
 
     def rotate_group(self):
         selected=self.selected_rows()
